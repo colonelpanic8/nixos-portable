@@ -1,4 +1,4 @@
-"""Build personal USB media from this checkout, without publishing credentials."""
+"""Write portable USB sticks and add personal setup bundles, without publishing credentials."""
 
 import argparse
 import base64
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -99,11 +100,12 @@ def prepare_identity(args, state):
 
 
 def seal_seed(seed, state):
-    bundle = state / "family-seed.age"
-    temporary = state / "family-seed.age.new"
+    bundle = state / f"{seed['hostname']}.age"
+    temporary = state / f"{seed['hostname']}.age.new"
     temporary.unlink(missing_ok=True)
     print(
-        "Choose a USB bundle passphrase. Enter it again after booting the new computer.", flush=True
+        "Choose a bundle passphrase. Enter it again on the stick to start personal setup.",
+        flush=True,
     )
     try:
         run("age", "--passphrase", "--output", temporary, input=json.dumps(seed).encode())
@@ -114,132 +116,223 @@ def seal_seed(seed, state):
     return bundle
 
 
-def build_iso(source, state):
-    link = state / "base-image"
-    run("nix", "build", str(source) + "#packages.x86_64-linux.iso", "--out-link", link)
-    images = list((link / "iso").glob("*.iso"))
+def setup_volume(path):
+    if path is None:
+        if platform.system() != "Darwin":
+            raise ValueError("Pass --volume with the mounted SETUP partition of the stick")
+        path = Path("/Volumes/SETUP")
+    if not (path / ".nixos-portable").is_file():
+        raise ValueError(f"{path} is not the SETUP volume of a portable NixOS stick")
+    return path
+
+
+def copy_seed(bundle, volume):
+    destination = volume / bundle.name
+    temporary = volume / (bundle.name + ".new")
+    shutil.copyfile(bundle, temporary)
+    os.replace(temporary, destination)
+    if platform.system() == "Darwin":
+        run("sync")
+    else:
+        os.sync()
+    return destination
+
+
+def build_image(source, state, stick):
+    link = state / "image"
+    expression = (
+        f'(builtins.getFlake "git+file://{source}").lib.mkStick'
+        ' (builtins.fromJSON (builtins.getEnv "PORTABLE_STICK"))'
+    )
+    run(
+        "nix",
+        "build",
+        "--impure",
+        "--expr",
+        f"({expression}).config.system.build.usbImage",
+        "--out-link",
+        link,
+        env={**os.environ, "PORTABLE_STICK": json.dumps(stick)},
+    )
+    images = list(link.glob("*.raw.xz"))
     if len(images) != 1:
-        raise ValueError("Expected exactly one ISO from the build")
+        raise ValueError("Expected exactly one disk image from the build")
     return images[0]
 
 
-def personalize_iso(base, bundle, output):
-    temporary = output.with_suffix(".iso.new")
-    temporary.unlink(missing_ok=True)
-    try:
-        run(
-            "xorriso",
-            "-indev",
-            base,
-            "-outdev",
-            temporary,
-            "-boot_image",
-            "any",
-            "replay",
-            "-map",
-            bundle,
-            "/family-seed.age",
-            "-commit",
-            "-end",
-        )
-        temporary.chmod(0o600)
-        temporary.replace(output)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def inspect_usb(device, image_size):
-    if platform.system() != "Darwin":
-        raise ValueError("Automatic writing currently supports macOS only")
-    data = subprocess.check_output(["diskutil", "info", "-plist", device])
-    info = plistlib.loads(data)
-    if (
-        not info.get("WholeDisk")
-        or info.get("Internal", True)
-        or info.get("BusProtocol") != "USB"
-        or not info.get("Writable", False)
-        or info.get("TotalSize", 0) < image_size
-    ):
+    """Describe a whole, writable USB disk, the same way on macOS and Linux."""
+    if platform.system() == "Darwin":
+        info = plistlib.loads(subprocess.check_output(["diskutil", "info", "-plist", device]))
+        suitable = (
+            info.get("WholeDisk")
+            and not info.get("Internal", True)
+            and info.get("BusProtocol") == "USB"
+            and info.get("Writable", False)
+        )
+        identifier = info.get("DeviceIdentifier")
+        disk = {
+            "id": identifier,
+            "name": info.get("MediaName"),
+            "size": info.get("TotalSize", 0),
+            "raw": f"/dev/r{identifier}",
+            "identity": [
+                info.get(key)
+                for key in ("DeviceIdentifier", "TotalSize", "MediaName", "DeviceTreePath")
+            ],
+        }
+    else:
+        listing = subprocess.check_output(
+            [
+                "lsblk",
+                "--json",
+                "--bytes",
+                "--nodeps",
+                "-o",
+                "PATH,TYPE,TRAN,RO,SIZE,MODEL,SERIAL",
+                device,
+            ]
+        )
+        [info] = json.loads(listing)["blockdevices"]
+        suitable = info["type"] == "disk" and info["tran"] == "usb" and not info["ro"]
+        disk = {
+            "id": Path(info["path"]).name,
+            "name": info.get("model"),
+            "size": info.get("size") or 0,
+            "raw": info["path"],
+            "identity": [info.get(key) for key in ("path", "size", "model", "serial")],
+        }
+    if not suitable or disk["size"] < image_size:
         raise ValueError("Select a writable external whole USB disk with enough space")
-    return info
+    return disk
+
+
+def image_size(image):
+    if image.suffix != ".xz":
+        return image.stat().st_size
+    listing = subprocess.check_output(["xz", "--robot", "--list", str(image)], text=True)
+    totals = next(line.split("\t") for line in listing.splitlines() if line.startswith("totals"))
+    return int(totals[4])
+
+
+def unmount(disk):
+    if platform.system() == "Darwin":
+        run("diskutil", "unmountDisk", disk["raw"].replace("/dev/r", "/dev/"))
+        return
+    listing = subprocess.check_output(["lsblk", "--json", "-o", "PATH,MOUNTPOINTS", disk["raw"]])
+    for device in json.loads(listing)["blockdevices"]:
+        for child in device.get("children") or []:
+            if any(child.get("mountpoints") or []):
+                run("sudo", "umount", child["path"])
 
 
 def write_usb(image, device):
-    info = inspect_usb(device, image.stat().st_size)
-    identifier = info["DeviceIdentifier"]
-    print(f"ERASE ALL DATA: {identifier}, {info.get('MediaName')}, {info['TotalSize']} bytes")
-    if input(f"Type ERASE {identifier} to write this USB: ") != f"ERASE {identifier}":
+    size = image_size(image)
+    disk = inspect_usb(device, size)
+    print(f"ERASE ALL DATA: {disk['id']}, {disk['name']}, {disk['size']} bytes")
+    if input(f"Type ERASE {disk['id']} to write this USB: ") != f"ERASE {disk['id']}":
         raise ValueError("USB write cancelled")
-    current = inspect_usb(device, image.stat().st_size)
-    for key in ("DeviceIdentifier", "TotalSize", "MediaName", "DeviceTreePath"):
-        if current.get(key) != info.get(key):
-            raise ValueError("USB identity changed; inspect devices again")
-    run("diskutil", "unmountDisk", device)
-    run("sudo", "dd", f"if={image}", f"of=/dev/r{identifier}", "bs=4194304")
+    if inspect_usb(device, size)["identity"] != disk["identity"]:
+        raise ValueError("USB identity changed; inspect devices again")
+    unmount(disk)
+    source = shlex.quote(str(image))
+    read = f"xz -dc {source}" if image.suffix == ".xz" else f"cat {source}"
+    raw = shlex.quote(disk["raw"])
+    run("sh", "-c", f"{read} | sudo dd of={raw} bs=4194304")
     run("sync")
     # Compare only the written image length; the USB is usually larger.
-    run("sudo", "cmp", "-n", str(image.stat().st_size), image, f"/dev/r{identifier}")
-    run("diskutil", "eject", device)
+    run("sh", "-c", f"{read} | sudo cmp -n {size} - {raw}")
+    if platform.system() == "Darwin":
+        run("diskutil", "eject", disk["raw"].replace("/dev/r", "/dev/"))
     print("USB write and byte-for-byte verification complete.")
+
+
+def stick_parameters(args):
+    stick = {}
+    if args.user:
+        stick["user"] = args.user
+    if args.hostname:
+        stick["hostname"] = args.hostname
+    keys = [
+        line.strip()
+        for path in args.authorized_key
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    if keys:
+        stick["authorizedKeys"] = keys
+    if args.persistent_tailscale:
+        stick["persistentTailscale"] = True
+    return stick
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--username", default="alex")
-    parser.add_argument("--hostname", default="alex-nixos")
-    parser.add_argument("--email", default="alexmalison@gmail.com")
-    parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--iso", type=Path, help="Use a previously built and verified base ISO")
-    parser.add_argument(
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    write = sub.add_parser("write", help="Erase a USB stick and write the portable image")
+    write.add_argument("--image", type=Path, help="A built and verified portable image")
+    write.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
+    write.add_argument("--device", required=True, help="Confirmed external whole USB disk")
+    stick = write.add_argument_group("building a stick (ignored with --image)")
+    stick.add_argument("--user", help="Login of the stick's main user (default nixos)")
+    stick.add_argument("--hostname", help="Hostname of the stick (default portable)")
+    stick.add_argument("--authorized-key", type=Path, action="append", default=[])
+    stick.add_argument(
+        "--persistent-tailscale",
+        action="store_true",
+        help="Keep the stick's Tailscale login across reboots",
+    )
+
+    seed = sub.add_parser("seed", help="Add a personal setup bundle to a portable stick")
+    seed.add_argument("--username", default="alex")
+    seed.add_argument("--hostname", default="alex-nixos")
+    seed.add_argument("--email", default="alexmalison@gmail.com")
+    seed.add_argument("--volume", type=Path, help="Mounted SETUP volume (default /Volumes/SETUP)")
+    seed.add_argument(
         "--stage-only",
         action="store_true",
-        help="Prepare identity and encrypted accounts without building or writing media",
+        help="Prepare identity and encrypted accounts without sealing or copying a bundle",
     )
-    parser.add_argument("--authorized-key", type=Path, action="append", default=[])
-    parser.add_argument("--tailscale-live-key", type=Path)
-    parser.add_argument("--tailscale-target-key", type=Path)
-    parser.add_argument("--device", help="Confirmed external whole USB disk, e.g. /dev/disk4")
-    parser.add_argument(
-        "--write-existing", type=Path, help="Write an already prepared ISO without rebuilding"
-    )
+    seed.add_argument("--authorized-key", type=Path, action="append", default=[])
+    seed.add_argument("--tailscale-live-key", type=Path)
+    seed.add_argument("--tailscale-target-key", type=Path)
     args = parser.parse_args()
     os.umask(0o077)
-    for executable in ("age", "xorriso", "ssh-keygen", "codex"):
-        if not shutil.which(executable):
-            raise ValueError(
-                f"Missing {executable}; run through `just family-usb` in the Nix shell"
-            )
-    if args.write_existing:
-        if not args.device:
-            parser.error("--write-existing requires --device")
-        write_usb(args.write_existing.resolve(), args.device)
+
+    if args.command == "write":
+        stick = stick_parameters(args)
+        if args.image:
+            if stick:
+                parser.error("--image is already built; drop the stick options or --image")
+            if not args.image.is_file():
+                raise ValueError("The portable image does not exist")
+            image = args.image.resolve()
+        else:
+            if args.user or args.hostname:
+                validate_identity(args.user or "nixos", args.hostname or "portable", "other")
+            state = Path.home() / ".local/state/nixos-portable"
+            state.mkdir(parents=True, exist_ok=True, mode=0o700)
+            image = build_image(args.source.resolve(), state, stick)
+        write_usb(image, args.device)
+        print("Plug the stick in again; its SETUP volume takes personal bundles.")
         return
+
+    for executable in ("age", "ssh-keygen", "codex"):
+        if not shutil.which(executable):
+            raise ValueError(f"Missing {executable}; run through `just prepare` in the Nix shell")
     validate_identity(args.username, args.hostname, "other")
+    volume = None if args.stage_only else setup_volume(args.volume)
     state = Path.home() / ".local/state/nixos-family-installer" / args.hostname
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # These local files must never become flake inputs or public release assets.
-    if state.is_relative_to(args.source.resolve()):
-        raise ValueError("Private preparation state must be outside the source checkout")
-    if args.iso and not args.iso.is_file():
-        raise ValueError("The base ISO does not exist")
-    seed = prepare_identity(args, state)
+    prepared = prepare_identity(args, state)
     if args.stage_only:
         print(f"Prepared public identity: {state / 'identity.json'}")
         return
-    base = args.iso.resolve() if args.iso else build_iso(args.source.resolve(), state)
-    if not base.is_file():
-        raise ValueError("The base ISO does not exist")
-    bundle = seal_seed(seed, state)
-    output = state / f"{args.hostname}-installer.iso"
-    personalize_iso(base, bundle, output)
+    bundle = seal_seed(prepared, state)
+    destination = copy_seed(bundle, volume)
     (state / "codex-login/auth.json").unlink()
-    print(f"Private installer: {output}\nPublic identity: {state / 'identity.json'}")
-    if args.device:
-        write_usb(output, args.device)
-    else:
-        print(
-            "Plug in the USB, inspect `diskutil list external physical`, then use --write-existing and --device."
-        )
+    print(f"Personal bundle: {destination}\nPublic identity: {state / 'identity.json'}")
 
 
 if __name__ == "__main__":

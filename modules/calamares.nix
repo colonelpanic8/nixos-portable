@@ -15,7 +15,7 @@
   };
   launchInstaller = pkgs.writeShellApplication {
     name = "family-installer";
-    runtimeInputs = [pkgs.xorg.xhost];
+    runtimeInputs = [pkgs.xhost];
     text = ''
       if [[ -n "''${WAYLAND_DISPLAY:-}" && -n "''${DISPLAY:-}" ]]; then
         xhost +si:localuser:root >/dev/null

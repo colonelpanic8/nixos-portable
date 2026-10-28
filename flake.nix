@@ -1,5 +1,5 @@
 {
-  description = "Graphical NixOS installer in dotfiles with a shared user profile";
+  description = "Portable NixOS USB stick with a graphical family installer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -40,17 +40,41 @@
     machineNames = builtins.filter (
       name: builtins.pathExists (./machines + "/${name}/default.nix")
     ) (builtins.attrNames (builtins.readDir ./machines));
-    iso = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      specialArgs = {familyInputs = inputs;};
-      modules = [./modules/iso.nix];
+    # Usable from other flakes: the agent tool pins travel with the module.
+    portableModule = {
+      imports = [./modules/portable.nix];
+      _module.args.familyInputs = inputs;
     };
+    # A stick with no credentials. Its parameters are recorded on the stick so
+    # `portable-update` rebuilds the same stick.
+    mkStick = {
+      user ? "nixos",
+      hostname ? "portable",
+      authorizedKeys ? [],
+      persistentTailscale ? false,
+    } @ parameters:
+      nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          portableModule
+          {
+            portable = {
+              liveUser = user;
+              tailscale.ephemeral = !persistentTailscale;
+              stickParameters = parameters;
+            };
+            networking.hostName = hostname;
+            users.users.${user}.openssh.authorizedKeys.keys = authorizedKeys;
+          }
+        ];
+      };
+    portable = mkStick {};
   in
     {
-      lib = {inherit mkMachine;};
+      lib = {inherit mkMachine mkStick;};
       nixosModules = {
         default = ./modules/managed-system.nix;
-        installer = ./modules/calamares.nix;
+        portable = portableModule;
       };
       nixosConfigurations =
         (builtins.listToAttrs (map (name: {
@@ -58,7 +82,7 @@
             value = mkMachine "x86_64-linux" (./machines + "/${name}/default.nix");
           })
           machineNames))
-        // {installer = iso;};
+        // {inherit portable;};
     }
     // flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
@@ -105,7 +129,7 @@
             primaryUser = cfg.myModules.primaryUser;
             failures = map (a: a.message) (builtins.filter (a: !a.assertion) cfg.assertions);
           });
-      rescueConfig =
+      installerConfig =
         (nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
@@ -117,18 +141,39 @@
             })
           ];
         }).config;
-      rescueCheck = assert !(rescueConfig ? isoImage);
-      assert !rescueConfig.services.desktopManager.plasma6.enable;
-      assert !rescueConfig.services.displayManager.autoLogin.enable;
-      assert rescueConfig.programs.partition-manager.enable;
-      assert rescueConfig.security.polkit.enable;
-      assert rescueConfig.security.wrappers.pkexec.enable;
-      assert builtins.attrNames (nixpkgs.lib.filterAttrs (_: user: user.isNormalUser) rescueConfig.users.users) == ["rescue-operator"];
-      assert builtins.all (a: a.assertion) rescueConfig.assertions;
-        pkgs.writeText "rescue-installer-module-check" (builtins.toJSON {
-          guide = rescueConfig.environment.etc."nixos-family-installer/README.md".source;
-          extensions = rescueConfig.system.build.familyCalamaresExtensions;
+      installerCheck = assert !(installerConfig ? isoImage);
+      assert !installerConfig.services.desktopManager.plasma6.enable;
+      assert !installerConfig.services.displayManager.autoLogin.enable;
+      assert installerConfig.programs.partition-manager.enable;
+      assert installerConfig.security.polkit.enable;
+      assert installerConfig.security.wrappers.pkexec.enable;
+      assert builtins.attrNames (nixpkgs.lib.filterAttrs (_: user: user.isNormalUser) installerConfig.users.users) == ["rescue-operator"];
+      assert builtins.all (a: a.assertion) installerConfig.assertions;
+        pkgs.writeText "installer-module-check" (builtins.toJSON {
+          guide = installerConfig.environment.etc."nixos-family-installer/README.md".source;
+          extensions = installerConfig.system.build.familyCalamaresExtensions;
         });
+      portableCheck = let
+        cfg = portable.config;
+        ssh = cfg.services.openssh;
+        firewall = cfg.networking.firewall;
+        normalUsers = builtins.attrNames (nixpkgs.lib.filterAttrs (_: user: user.isNormalUser) cfg.users.users);
+      in
+        assert normalUsers == ["nixos"];
+        assert cfg.services.displayManager.autoLogin.user == "nixos";
+        assert cfg.services.desktopManager.plasma6.enable;
+        assert !ssh.openFirewall;
+        assert !(builtins.elem 22 firewall.allowedTCPPorts);
+        assert firewall.interfaces.tailscale0.allowedTCPPorts == [22];
+        assert builtins.elem "--state=mem:" cfg.services.tailscale.extraDaemonFlags;
+        assert builtins.elem "/run/family-installer/authorized_keys/%u" ssh.authorizedKeysFiles;
+        assert cfg.fileSystems."/".device == "/dev/disk/by-label/PORTABLE-ROOT";
+        assert cfg.fileSystems."/setup".device == "/dev/disk/by-label/SETUP";
+        assert builtins.elem "nofail" cfg.fileSystems."/setup".options;
+        assert cfg.boot.loader.systemd-boot.enable && !cfg.boot.loader.efi.canTouchEfiVariables;
+        assert !(cfg ? age);
+        assert builtins.all (a: a.assertion) cfg.assertions;
+          pkgs.writeText "portable-stick-check" (builtins.unsafeDiscardStringContext cfg.system.build.toplevel.drvPath);
       provisionedCheck = tailscale: let
         helperKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureHelperKeyOnly helper";
         cfg =
@@ -187,7 +232,8 @@
     in {
       formatter = pkgs.alejandra;
       devShells.default = pkgs.mkShell {
-        packages = [pkgs.just pkgs.git pkgs.alejandra python pkgs.openssh pkgs.qemu pkgs.age pkgs.xorriso];
+        packages = [pkgs.just pkgs.git pkgs.alejandra python pkgs.openssh pkgs.qemu pkgs.age pkgs.xz];
+        OVMF = pkgs.OVMF.fd;
       };
       checks =
         {
@@ -195,7 +241,7 @@
             alejandra --check ${./flake.nix} ${./modules} ${./modules/user-profile.nix}
             touch "$out"
           '';
-          helper = pkgs.runCommand "installer-helper-tests" {nativeBuildInputs = [python pkgs.openssh pkgs.nix pkgs.age];} ''
+          helper = pkgs.runCommand "installer-helper-tests" {nativeBuildInputs = [python pkgs.openssh pkgs.nix pkgs.age pkgs.xz];} ''
             cp -r ${./scripts} scripts
             cp -r ${./tests} tests
             cp -r ${./calamares} calamares
@@ -210,10 +256,11 @@
         // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           other-user = profileCheck "other";
           ivan-user = profileCheck "ivan";
-          rescue-module = rescueCheck;
+          installer-module = installerCheck;
+          portable-stick = portableCheck;
           installer-state-version = pkgs.runCommand "installer-state-version" {} ''
             grep -F '    version = "${nixpkgs.lib.trivial.release}"' \
-              ${rescueConfig.system.build.familyCalamaresExtensions}/lib/calamares/modules/nixos/main.py
+              ${installerConfig.system.build.familyCalamaresExtensions}/lib/calamares/modules/nixos/main.py
             touch "$out"
           '';
           provisioned-profile = provisionedCheck false;
@@ -225,9 +272,9 @@
           '';
         };
       packages = nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
-        default = iso.config.system.build.isoImage;
-        iso = iso.config.system.build.isoImage;
-        calamares-extensions = iso.config.system.build.familyCalamaresExtensions;
+        default = portable.config.system.build.usbImage;
+        usb-image = portable.config.system.build.usbImage;
+        calamares-extensions = portable.config.system.build.familyCalamaresExtensions;
       };
     });
 }

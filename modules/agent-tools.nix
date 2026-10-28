@@ -20,12 +20,20 @@
     '';
   };
 in {
-  options.familyInstaller.agentTools.enable = lib.mkEnableOption "T3 Code and the primary user's coding agents";
+  options.familyInstaller.agentTools = {
+    enable = lib.mkEnableOption "T3 Code and the primary user's coding agents";
+    packages = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      defaultText = lib.literalMD "T3 Code, Codex, and Claude Code pinned by this flake";
+      default = [
+        t3code
+        familyInputs.codex.packages.${system}.default
+        familyInputs.claude.packages.${system}.default
+      ];
+      description = "Agent applications to install. T3 Code must provide t3code-desktop.";
+    };
+  };
   config = lib.mkIf config.familyInstaller.agentTools.enable {
-    environment.systemPackages = [
-      t3code
-      familyInputs.codex.packages.${system}.default
-      familyInputs.claude.packages.${system}.default
-    ];
+    environment.systemPackages = config.familyInstaller.agentTools.packages;
   };
 }

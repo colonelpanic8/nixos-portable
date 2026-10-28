@@ -1,23 +1,29 @@
-# NixOS family installer
+# Portable NixOS USB and family installer
 
-Prepare a personal installer USB on an existing trusted computer, then install
-NixOS through Calamares with T3 Code and the new owner's agent account. The
-installer lives in `nixos/family-installer/` in
-[dotfiles](https://github.com/colonelpanic8/dotfiles), alongside Ivan's existing
-rescue ISO and persistent USB configuration. Alex prepares media from his MacBook
-Air's existing `/Users/Shared/dotfiles` checkout. His authenticated Codex account
-and a newly generated target host key can be staged before booting the PC. No
-separate repository, release upload, or new branch is needed to prepare media.
+A writable NixOS installation on a USB stick that you can carry around. It
+works as a rescue system, as a NixOS you can keep using, and as a graphical
+installer for family computers. You write the generic stick once. For each
+computer, preparation adds an encrypted personal bundle to the stick's `SETUP`
+volume. That bundle holds the new owner's agent account, a newly generated host
+key, and any helper access you selected. Calamares then installs NixOS with
+T3 Code and that account.
+
+The generic stick contains no credentials. Ivan's own stick is this same module
+plus a personal layer in
+[dotfiles](https://github.com/colonelpanic8/dotfiles)
+(`nixos/machines/rescue-usb.nix`): his account, Hyprland, Tailscale enrollment,
+and desktop agent apps.
 
 This is the operating guide for the person installing, a remote helper, and an
 assisting agent. Start at the section matching the current state. Commands in
 an installed-system section run on the new family computer, not Ivan's workstation.
 
-- [Prepare personal media on Alex's Mac](#prepare-personal-media-on-alexs-mac)
-- [Choose the media](#choose-the-media)
-- [Build the family ISO](#build-the-family-iso)
-- [Prepare the USB on Windows](#prepare-the-usb-on-windows)
-- [Write and boot a USB stick](#write-and-boot-a-usb-stick)
+- [What is on the stick](#what-is-on-the-stick)
+- [Make a stick for someone](#make-a-stick-for-someone)
+- [Prepare a stick on Alex's Mac](#prepare-a-stick-on-alexs-mac)
+- [Build the image](#build-the-image)
+- [Write the image from Windows or Linux](#write-the-image-from-windows-or-linux)
+- [Boot the stick](#boot-the-stick)
 - [Connect a remote helper](#connect-a-remote-helper)
 - [Install through Calamares](#install-through-calamares)
 - [Replace an existing installation](#replace-an-existing-installation)
@@ -30,341 +36,303 @@ an installed-system section run on the new family computer, not Ivan's workstati
 - [Maintain the installer](#maintain-the-installer)
 - [Implementation reference](#implementation-reference)
 
-## Prepare personal media on Alex's Mac
+## What is on the stick
 
-Use the MacBook Air already on Tailscale, logged in as `alex`. This Mac prepares
-the USB; NixOS goes on the separate x86_64 PC. The Mac's internal disk is never
-an installation destination. Read [START-HERE.md](START-HERE.md) for the short
-live-USB walkthrough and a prompt for the assisting agent.
+| Partition | Label (GPT partition label for the ESP) | Contents |
+| --- | --- | --- |
+| EFI system (1 GiB) | `PORTABLE-ESP` | systemd-boot, NixOS generations, memtest86+ |
+| FAT data (256 MiB) | `SETUP` | Personal bundles (`*.age`). Mounted at `/setup` on the stick; macOS and Windows mount it automatically |
+| ext4 root | `PORTABLE-ROOT` | The NixOS installation. It grows to fill the stick on first boot |
 
-The base ISO contains T3 Code, Codex, Claude Code, and Calamares. It contains no
-provider credentials. Personalization adds a passphrase-encrypted bundle after
-the Nix build, outside the Nix store. The bundle contains a new target SSH host
-identity and only the explicitly selected accounts/access. Do not publish the
-personal ISO or put preparation state into Git.
+The generic stick logs in to Plasma automatically as its main user (`nixos`
+unless built for someone; see below), with an empty password and passwordless
+`sudo`. It includes Calamares (**Install System**),
+**Start personal setup**, T3 Code, Codex, Claude Code, Tailscale, Firefox,
+GParted, and a disk, filesystem, and hardware rescue kit. Its state persists
+across reboots, except Tailscale, which keeps its state in memory: every boot
+starts unenrolled. SSH listens only on `tailscale0`.
 
-On the Mac, from the existing checkout:
+The first boot registers the Nix store, creates the system profile, and installs
+systemd-boot. After that the stick is an ordinary NixOS system. Update it with
+`portable-update`, which rebuilds the latest release of this repository with
+the parameters the stick was built with (recorded in
+`/etc/nixos-portable/stick.json`). Update Ivan's stick with `just switch` from
+`/srv/dotfiles/nixos` instead.
+
+**Start personal setup** lists the bundles on `SETUP` and asks for the
+passphrase of the one you choose. It then installs that bundle's accounts into
+a separate, in-memory home (`/run/family-setup`) and opens T3 Code
+there. The stick's own logins and files therefore never reach the installed
+computer. The unlocked session ends at reboot. While a bundle is on `SETUP`,
+Calamares refuses to install until one is unlocked. For a generic installation,
+move the bundles off the `SETUP` volume.
+
+## Make a stick for someone
+
+A stick for someone else, such as Ivan's dad, is this repository's stick built
+with their login. It carries nothing from Ivan's dotfiles: no credentials, no
+Hyprland, and no agenix secrets. On x86_64 Linux, from a checkout:
 
 ```sh
-cd /Users/Shared/dotfiles/nixos
-just family-usb --iso /Users/alex/Downloads/nixos-family-base.iso \
-  --authorized-key /Users/alex/.ssh/id_ed25519.pub
+nix develop --command just prepare write \
+  --user dad --hostname dad-stick \
+  --authorized-key ~/.ssh/id_ed25519.pub \
+  --device /dev/disk/by-id/usb-REPLACE_WITH_CONFIRMED_DEVICE
 ```
 
-Use the actual verified base ISO path supplied during preparation. A helper
-can build it with `just family-iso` on Linux and copy it directly with SCP;
-there is no need to publish it. Compare SHA-256 at both ends before preparing
-personal media. Omitting `--iso` builds the base image from this checkout.
-That requires x86_64 Linux or a configured Linux builder: Apple Silicon macOS
-alone cannot execute x86_64 Linux builds. Nix and an existing clone alone do
-not provide a Linux builder.
+This builds the image for those parameters and then writes it with the
+`ERASE` confirmation described below. On Linux, it unmounts the stick's
+mounted partitions first. Options:
 
-Defaults are login `alex`, hostname `alex-nixos`, account email
-`alexmalison@gmail.com`, and **Another person**. Override with `--username`,
-`--hostname`, and `--email` when preparing another person's computer. The
-command opens a **separate Codex login for the new PC**, using
-`~/.local/state/nixos-family-installer/<hostname>/codex-login` as `CODEX_HOME`.
-Sign in as `alexmalison@gmail.com` in the browser when prompted. The command
-checks that email before exporting. It never exports the Mac's usual
-`~/.codex/auth.json`: sharing a refresh token between independent computers can
-invalidate their sessions. After successfully creating the personal ISO, it
-removes the temporary login file from the preparation profile. It does not copy
-conversations, settings, Git-sync directories, or GPG material. Claude Code is
-installed but its account is not exported; sign in separately later if wanted.
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--user` | `nixos` | Login of the stick's main user, which logs in automatically |
+| `--hostname` | `portable` | Hostname, including the stick's Tailscale name |
+| `--authorized-key` | none | Public keys (files) allowed to SSH in as that user over Tailscale; repeatable |
+| `--persistent-tailscale` | off | Keep the stick's Tailscale login across reboots, for ongoing remote help |
 
-The command keeps the prepared host identity under
-`~/.local/state/nixos-family-installer/<hostname>/`, reusing it on retries.
-Only `identity.json` and the `.pub` file are public. The private host key remains
-on this trusted preparation Mac and travels in the encrypted personal bundle.
-Inside that bundle, account credentials are additionally encrypted to the host
-key. Choose a USB bundle passphrase when prompted; enter it again on the live
-USB. This protects the credentials if the USB is lost. It is separate from the
-eventual disk-unlock and login passwords. Keep private media out of cloud
-sharing and source control.
+These are ordinary build parameters: everything they put on the stick is
+public. Keep credentials off the stick. An agent login for a computer
+the stick installs travels in a personal bundle (next section). From Nix, the
+same stick is
+`nixos-portable.lib.mkStick { user = "dad"; hostname = "dad-stick"; }`.
 
-After preparation, plug in the intended USB and inspect:
+## Prepare a stick on Alex's Mac
+
+Use the MacBook Air already on Tailscale, logged in as `alex`, with a checkout
+of this repository. This Mac prepares the stick; NixOS goes on the separate
+x86_64 PC. The Mac's internal disk is never an installation destination. Read
+[START-HERE.md](START-HERE.md) for the short walkthrough and a prompt for the
+assisting agent.
+
+### 1. Write the portable image (once per stick)
+
+Skip this step if the stick already has the portable image. In that case its
+`SETUP` volume appears in Finder. Otherwise get a verified image built from this
+repository (see [Build the image](#build-the-image)). A helper can build it on
+Linux and copy it over with SCP. Compare SHA-256 at both ends. Then plug in the
+stick and inspect:
 
 ```sh
 diskutil list external physical
 ```
 
-Match model and capacity, back up any needed USB files, then write the completed
-personal image. Replace `/dev/diskN` with the actual external whole USB disk:
+Match model and capacity, back up any needed files on the stick, then write.
+Replace `/dev/diskN` with the actual external whole USB disk:
 
 ```sh
-just family-usb \
-  --write-existing /Users/alex/.local/state/nixos-family-installer/alex-nixos/alex-nixos-installer.iso \
-  --device /dev/diskN
+just prepare write --image /Users/alex/Downloads/nixos-portable.raw.xz --device /dev/diskN
 ```
 
 **This erases every file and partition on that USB.** The writer rejects
 internal disks, partitions, non-USB devices, read-only media, and undersized
-devices. It displays the selected disk and requires typing `ERASE diskN` before
-writing. It rechecks identity, writes the image, verifies the bytes, and ejects
-the stick. Preparation can also take `--device` to do both stages in one run.
-No USB write happens without that explicit device confirmation.
+devices. It displays the selected disk and requires typing `ERASE diskN`
+before writing. It rechecks the disk's identity, writes the image, verifies
+the bytes, and ejects the stick. Without `--image`, it builds the image from
+this checkout. That requires x86_64 Linux or a configured Linux builder; Apple
+Silicon macOS alone cannot build x86_64 Linux images.
 
-Boot the separate PC from the USB. Connect its network and use **Start personal
-setup**. The terminal unlocks the bundle, installs the selected account login
-into the live user's home, and launches T3 Code. Open the `Setup` project and
-use the prompt in `START-HERE.md`. Choose Codex.
-Calamares refuses to partition a personal USB installation until the bundle is
-unlocked, and validates the prepared user, hostname, and owner.
-Its disk, bootloader, encryption and password screens remain in charge of the
-installation. The person must separately confirm the actual internal disk.
+### 2. Add a personal bundle (once per computer)
 
-At the end of installation, Calamares stops the live Codex processes, encrypts
-the live session's current credentials for the target (including token refreshes
-during setup), and removes the live login. The live agent disconnecting at this
-point is expected. Reboot when Calamares finishes; continue with the agent on
-the installed system.
-The installed computer receives T3 Code and those credentials at first boot,
-then deletes its encrypted account bootstrap file. Later logout or account
-changes are preserved. The personal USB is a **single-install credential
-transfer**, not reusable authenticated rescue media: booting its original
-credential snapshot again may require a fresh login. After a successful install,
-erase the personal USB and delete its private ISO and bundle from the Mac when
-no longer needed. Keep the public identity record for support.
-Credentials remain revocable and may expire or require a later provider login;
-preparation is not a promise of permanent authentication. The live T3
-conversation is ephemeral, so save needed notes to the target before rebooting.
+Plug the stick in again so that `/Volumes/SETUP` appears, then run:
+
+```sh
+just prepare seed --authorized-key /Users/alex/.ssh/id_ed25519.pub
+```
+
+Defaults are login `alex`, hostname `alex-nixos`, account email
+`alexmalison@gmail.com`, and **Another person**. To prepare another person's
+computer, override them with `--username`, `--hostname`, and `--email`. Use
+`--volume` when the `SETUP` volume is mounted somewhere else. The command opens
+a **separate Codex login for the new PC**. It uses
+`~/.local/state/nixos-family-installer/<hostname>/codex-login` as `CODEX_HOME`.
+Sign in as `alexmalison@gmail.com` in the browser when prompted. The command
+checks that email before exporting. It never exports the Mac's usual
+`~/.codex/auth.json`: sharing a refresh token between independent computers
+can invalidate their sessions. After it has copied the bundle to the stick, it
+removes the temporary login file from the preparation profile. It does not
+copy conversations, settings, Git-sync directories, or GPG material. Claude
+Code is installed but its account is not exported; sign in separately later
+if wanted.
+
+The command keeps the prepared host identity under
+`~/.local/state/nixos-family-installer/<hostname>/` and reuses it on retries.
+Only `identity.json` and the `.pub` file are public. The private host key stays
+on this trusted preparation Mac and travels in the encrypted bundle. Inside the
+bundle, account credentials are additionally encrypted to the host key. Choose
+a bundle passphrase when prompted; you enter it again on the stick. It protects
+the credentials if the stick is lost, and it is separate from the eventual
+disk-unlock and login passwords. Keep private media out of cloud sharing and
+source control.
+
+The bundle is written to `SETUP/<hostname>.age`. One stick can carry bundles
+for several computers. Eject the stick in Finder before unplugging it.
+
+### 3. Install
+
+Boot the separate PC from the stick. Connect its network. On the generic stick,
+**Start personal setup** opens automatically while a bundle is present. Choose
+the bundle and enter its passphrase; T3 Code then opens. Open the `Setup`
+project and use the prompt in `START-HERE.md`. Choose Codex. Calamares refuses
+to partition while a bundle is still locked, and it validates the prepared
+user, hostname, and owner. Its disk, bootloader, encryption, and password
+screens remain in charge of the installation. The person must separately
+confirm the actual internal disk.
+
+At the end of installation, Calamares stops the setup session's Codex
+processes. Codex sessions belonging to the stick's own user are left alone.
+It then encrypts the setup session's current credentials for the target,
+including token refreshes during setup, and removes the live login. The live
+agent disconnecting at this point is expected. Reboot when Calamares finishes,
+and continue with the agent on the installed system. The installed computer
+receives T3 Code and those credentials at first boot, then deletes its
+encrypted account bootstrap file. Later logouts or account changes are kept.
+
+A bundle is a **single-install credential transfer**. Booting its original
+credential snapshot again may require a fresh login. After a successful
+install, delete `SETUP/<hostname>.age` and the Mac's copy under
+`~/.local/state/nixos-family-installer/<hostname>/` when you no longer need
+them. Keep the public identity record for support. Credentials remain
+revocable and may expire or require a later provider login; preparation is not
+a promise of permanent authentication. The setup session's home is in memory,
+so save needed notes to the target before rebooting.
 
 ### Optional pre-authorized remote support
 
 Pass each approved helper's Ed25519 **public** key with `--authorized-key`.
-Never pass a private helper key. Prepared targets accept key-based SSH on
-`tailscale0`, disable password/root SSH, and do not open SSH to the LAN.
+Never pass a private helper key. While the bundle is unlocked, the stick
+accepts those keys for its live user through `/run/family-installer`. Nothing
+is written to the stick's home. Prepared targets accept key-based SSH on
+`tailscale0`, disable password and root SSH, and do not open SSH to the LAN.
 
-To avoid a Tailscale login at installation, arrange two distinct pre-authorized,
-appropriately scoped, single-use enrollment keys ahead of time: one for the live installer,
-one for the permanent PC. Pass paths using `--tailscale-live-key` and
-`--tailscale-target-key`. The command encrypts each to the new host key; neither
-is a Nix input. The live node uses `<hostname>-installer`; the target enrolls
-independently at first boot. Its encrypted enrollment key and runtime plaintext
-are removed after Tailscale reports Running. If enrollment fails, the encrypted
-key remains for retry; replace an expired key or remove that bootstrap file
-before retrying with interactive login. Do not copy the Mac's Tailscale state or reuse its
-device identity. A tag or auth key alone does not restrict access: verify the
-tailnet's policy permits only the intended helper access and does not grant
-the family device broad access to Ivan's machines.
+To avoid a Tailscale login at installation, arrange two distinct
+pre-authorized, appropriately scoped, single-use enrollment keys ahead of
+time: one for the live stick and one for the permanent PC. Pass their paths
+with `--tailscale-live-key` and `--tailscale-target-key`. The command encrypts
+each one to the new host key; neither is a Nix input. The live node uses
+`<hostname>-installer`. A stick that is already connected to Tailscale (Ivan's,
+for example) keeps its existing login and ignores the live key. The target
+enrolls independently at first boot. Its encrypted enrollment key and runtime
+plaintext are removed after Tailscale reports Running. If enrollment fails,
+the encrypted key remains for retry; replace an expired key, or remove that
+bootstrap file before retrying with an interactive login. Do not copy the
+Mac's Tailscale state or reuse its device identity. A tag or auth key alone
+does not restrict access: verify that the tailnet's policy permits only the
+intended helper access and does not give the family device broad access to
+Ivan's machines.
 
 Without these keys, Tailscale is available but not pre-authenticated. Codex
 assistance and installation still work locally. Neither `--authorized-key`
 nor a running Tailscale daemon implies that remote enrollment is complete.
-Only report support ready after actually testing the intended connection.
+Only report support as ready after actually testing the intended connection.
 
-## Choose the media
+## Build the image
 
-For Alex's prepared setup, use the **personalized family Plasma ISO on his Mac**.
-The current base image contains the custom installer, T3 Code, agent CLIs and Tailscale, and
-boots into the desktop used in the installation tests. This is the default
-choice for Alex's installation. Use the combined rescue image only when the
-helper explicitly chooses it. `rescue-usb` is Ivan's device-specific persistent
-installation, not an ISO for another USB stick.
-
-The standalone family ISO boots an ephemeral Plasma desktop. Its default live
-account is `nixos`. It includes Calamares and Tailscale. Connect to the internet
-before installation because Nix may download dependencies. The desktop session,
-its temporary password, and its Tailscale login disappear after reboot.
-
-The same dotfiles checkout contains both rescue configurations:
-
-| Configuration | Purpose | Build from `/srv/dotfiles/nixos` |
-| --- | --- | --- |
-| `rescue` | Ephemeral Hyprland rescue ISO with agent apps and disk tools | `nix build .#nixosConfigurations.rescue.config.system.build.isoImage` |
-| `rescue-usb` | Writable NixOS installation on Ivan's existing SanDisk USB, with persistent state and memory-test boot entries | `nix build .#nixosConfigurations.rescue-usb.config.system.build.toplevel` |
-
-Those configurations use `nixos/rescue-image.nix`. The USB's device-specific
-layout is in `nixos/rescue-usb.nix`; it is not a generic image-writing recipe.
-Building its `toplevel` does not install or update the physical stick. Never
-reuse its hardcoded device path or filesystem UUID for another computer.
-
-From this directory, the reusable module is `modules/calamares.nix`, also exported
-as `nixosModules.installer`. A rescue system can import that module to provide
-the same graphical installer without changing its desktop, accounts, or boot
-layout. The module also installs this guide at
-`/etc/nixos-family-installer/README.md` and the agent instructions alongside it.
-An older rescue stick needs an update before it has this integration.
-
-The rescue account is `imalison`, with passwordless local sudo. A persistent
-rescue USB can retain app logins, SSH keys, Tailscale state, and other files.
-Use a fresh family ISO when handing media to someone who must not receive that
-state. The installer generates the target configuration from the choices in
-Calamares; it does not clone the rescue system's accounts or home directory.
-
-## Build the family ISO
-
-Build the current checkout on x86_64 Linux with Git and Nix. Flakes must be available.
-For Alex's personal media, use the current `master` checkout containing this
-workflow. The older published generic ISO does not contain personal enrollment.
-`family-stable` controls reviewed updates to installed systems; preparing this
-USB does not require switching the Mac to that branch.
-The project provides its remaining development tools through Nix.
+Build on x86_64 Linux with Nix and flakes:
 
 ```sh
-git clone https://github.com/colonelpanic8/dotfiles.git
-cd dotfiles
-cd nixos/family-installer
+git clone https://github.com/colonelpanic8/nixos-portable.git
+cd nixos-portable
 nix develop --command just check
 nix flake check
-nix develop --command just build
+nix build .#usb-image
 ```
 
 With direnv, run `direnv allow` after reviewing `.envrc`, then use
-`direnv exec . just check` and `direnv exec . just build` instead.
-
-The ISO appears under `result/iso/`. Record its checksum and the release commit
-so a helper can identify the exact media:
+`direnv exec . just check` and `direnv exec . just build` instead. The
+xz-compressed raw image appears under `result/`. Most of its root filesystem
+is free space that compresses away; uncompressed, it needs a stick of at least
+32 GB. Record its checksum and the commit so a helper
+can identify the exact media:
 
 ```sh
 git rev-parse HEAD
-sha256sum result/iso/*.iso
+sha256sum result/*.raw.xz
 ```
 
-`master` is the dotfiles development branch. `family-stable` is the manually
-promoted family release in the same repository. Workstation commits do not
-advance `family-stable` or update existing family computers. This directory has
-its own Nixpkgs and Home Manager lockfile. Building it does not evaluate the
-workstation flake or fetch its private inputs, and needs no Git submodules.
+You can also build from GitHub without a checkout:
+`nix build github:colonelpanic8/nixos-portable#usb-image`. Ivan's personal
+image comes from dotfiles: `just rescue-usb-image` in `/srv/dotfiles/nixos`.
 
-From `/srv/dotfiles/nixos`, `just family-iso` builds the standalone image and
-`just rescue-iso` builds the combined rescue image. `just rescue-usb-build`
-builds the persistent USB system without writing a disk or activating it.
-These recipes create `nixos/result-family`, `nixos/result-rescue`, and
-`nixos/result-rescue-usb`, respectively. Only the first two contain ISO files.
+To exercise the image without a physical stick, run
+`nix develop --command just vm`. It boots a disposable copy of the image under
+UEFI as a USB device, with a blank 40 GiB virtual disk to install onto, and
+prints the directory holding those files. Remove that directory after shutting
+down the VM.
 
-To exercise the ISO without a physical disk, run:
+`master` is the development branch. `family-stable` is the manually promoted
+release that installed family computers follow. Building or writing a stick
+does not need that branch. This repository has its own Nixpkgs and Home
+Manager lockfile; building it does not evaluate the dotfiles workstation flake
+or fetch its private inputs.
 
-```sh
-nix develop --command just vm
-```
+## Write the image from Windows or Linux
 
-That recipe creates a disposable 40 GiB virtual disk and prints its path. It
-uses KVM when available. Keep the disk to inspect the installation, or remove
-that printed file after shutting down the VM. The recipe does not test UEFI;
-use an OVMF-configured VM for a UEFI installation test.
-
-You can also build the family image from its public release URL on x86_64
-Linux with Nix and Git, without a local dotfiles checkout:
-
-```sh
-nix build 'git+https://github.com/colonelpanic8/dotfiles?dir=nixos/family-installer&ref=family-stable#iso' --out-link result-family
-sha256sum result-family/iso/*.iso
-```
-
-If Nix has not enabled flakes, add
-`--extra-experimental-features 'nix-command flakes'` to the `nix` command.
-Updating a checkout supplies the source and recipes; the build command still
-has to run to produce an ISO. Windows alone cannot build this Linux image.
-A configured x86_64 Linux environment, including WSL2 with Nix, can build it.
-A Windows computer only needs the completed ISO to write the USB.
-
-## Prepare the USB on Windows
-
-The older prebuilt [family installer release](https://github.com/colonelpanic8/dotfiles/releases/tag/family-installer-2026-10-21)
-is a fallback generic installer. It predates personal agent enrollment; use the
-prepared Mac image for Alex's current setup. To use that older release, download `Download-Installer.ps1` from
-that release. Ask the assisting agent to inspect it, then run it in PowerShell:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Download-Installer.ps1
-```
-
-This sets the execution policy only for that process. The script downloads two
-image parts, verifies their SHA-256 checksums, joins them, and verifies the full
-ISO. It prints the verified file's path under your Downloads folder. It writes
-no disks. The parts are needed because GitHub limits each release asset to
-2 GiB. Do not flash a `.part01` or `.part02` file, the script, or a source ZIP.
-Use the assembled `.iso` file. `SHA256SUMS` and `BUILD-INFO.txt` on the release
-record the checksum and exact dotfiles source commit.
-
-If the helper supplies a complete ISO instead, use that file and its checksum.
-The helper can build both from the release command above. Ask for the actual
-image file or a working download link; a path on the helper's computer is not
-a download. A source ZIP from GitHub is not an ISO. Confirm the destination
-computer supports x86_64; the preparation computer's architecture does not
-establish the destination's architecture.
-
-**Writing the ISO erases every file and partition on the selected USB.**
+**Writing the image erases every file and partition on the selected USB.**
 Back up its files. Unplug other removable drives to reduce selection mistakes.
+Use a stick of at least 32 GB.
 
-1. Download the ISO to the Windows computer. If a shared Drive file requires
-   login, use the email address to which the helper granted access.
-2. Open PowerShell. Replace the path with the actual downloaded file:
+On Windows, verify the file with
+`Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\path\to\nixos-portable.raw.xz'`
+and compare all 64 hexadecimal digits with the helper's checksum. Then use
+[balenaEtcher](https://etcher.balena.io/): **Flash from file**, select the
+verified `.raw.xz` image (Etcher decompresses it), **Select target**, match the stick's model and capacity,
+and **Flash**. Let both writing and validation finish. If Windows offers to
+format the stick afterwards, cancel. After writing, Windows mounts the `SETUP`
+volume, which can take a bundle prepared elsewhere.
 
-   ```powershell
-   Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\Users\YOUR-USER\Downloads\YOUR-IMAGE.iso'
-   ```
-
-   Compare all 64 hexadecimal digits with the helper's checksum. Letter case
-   does not matter. If they differ, download again and do not flash that file.
-3. Download Windows x64 [balenaEtcher](https://etcher.balena.io/) from its
-   official site. Use **Flash from file** and select the verified ISO.
-4. Use **Select target**. Match the USB's model and capacity to the device
-   the person has confirmed may be erased. Do not select an internal drive
-   or a duplicate USB entry that reports no media. Do not rely on a remembered
-   Windows disk number after unplugging or restarting.
-5. Review the selected USB and click **Flash**. Accept the administrator
-   prompt for the writer. Let both writing and validation finish successfully.
-6. If Windows offers to format the newly written USB, cancel. The installer
-   has Linux partitions Windows may not recognize. Eject the stick if it is
-   still mounted. Do not manually partition or preformat it.
-7. Move the USB to the destination computer and follow the boot instructions
-   below. Writing media does not install NixOS on the Windows preparation PC.
-
-Etcher's [official guide and downloads](https://etcher.balena.io/) describe
-image selection, target selection, flashing, and validation. Creating media
-needs neither a Nix installation nor WSL on the Windows computer.
-
-## Write and boot a USB stick
-
-Back up files on the destination computer before installing an operating
-system. Also back up the USB stick; writing an ISO replaces its contents.
-Do not overwrite Ivan's persistent rescue USB unless he intends to replace it.
-
-Use a disk-image writer's raw image mode, not a normal file copy. On Linux,
-inspect the available devices before selecting the USB:
+On Linux, `just prepare write --image <file> --device <disk>` checks that
+the device is a whole, writable USB disk, asks for the `ERASE` confirmation,
+then writes and verifies it. To write by hand instead, inspect the available
+devices before selecting the stick:
 
 ```sh
 lsblk -p -o NAME,SIZE,MODEL,TRAN,FSTYPE,MOUNTPOINTS
 ls -l /dev/disk/by-id/usb-*
 ```
 
-Match the USB by model and capacity. Unmount its mounted partitions using the
-file manager. The output device must be the whole USB device, not a partition
-such as `/dev/sdb1` or a by-id name ending in `-part1`.
-
-For a command-line write, replace both placeholders with the paths you have
-checked. These commands are examples; an agent must have confirmation of the
-actual destination device before executing the write.
+Match the stick by model and capacity, and unmount its mounted partitions. The
+output device must be the whole USB device, not a partition such as
+`/dev/sdb1` or a by-id name ending in `-part1`. An agent must have
+confirmation of the actual destination device before running the write:
 
 ```sh
-ISO=/absolute/path/to/nixos-family-image.iso
+IMAGE=/absolute/path/to/nixos-portable.raw.xz
 USB_DEVICE=/dev/disk/by-id/usb-REPLACE_WITH_CONFIRMED_DEVICE
-test -f "$ISO" && test -b "$USB_DEVICE"
+test -f "$IMAGE" && test -b "$USB_DEVICE"
 lsblk -p -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS "$USB_DEVICE"
-sudo dd if="$ISO" of="$USB_DEVICE" bs=4M conv=fsync status=progress
+xz -dc "$IMAGE" | sudo dd of="$USB_DEVICE" bs=4M conv=fsync status=progress
 sync
 ```
 
 If the file or device check fails, stop and correct the paths before running
-`dd`. Do not substitute a guessed `/dev/sdX` name.
+`dd`. Do not substitute a guessed `/dev/sdX` name. On Linux, add a bundle with
+`just prepare seed --volume <mounted SETUP path>`.
 
-Restart the destination computer and select the USB in its firmware boot menu.
-Use its UEFI entry for a UEFI installation. If Secure Boot rejects the image,
-record the existing firmware setting before disabling Secure Boot for this
-unsigned media. Confirm any disk-recovery requirements of the existing OS
-before changing its firmware settings.
+Do not overwrite Ivan's own stick unless he intends to replace it. It holds
+his persistent home and Tailscale state.
 
-A family ISO reaches a Plasma desktop. Open **Install System** if Calamares
-does not open automatically. A combined rescue build reaches Hyprland; open
-its application launcher with Super+P and choose **Install System**, or run
-`family-installer` from Ghostty with Super+Shift+Return.
+## Boot the stick
+
+Restart the destination computer and select the stick's UEFI entry in its
+firmware boot menu. The stick is UEFI-only. If Secure Boot rejects it, record
+the existing firmware setting before disabling Secure Boot for this unsigned
+media. Confirm any disk-recovery requirements of the existing OS before
+changing its firmware settings.
+
+The generic stick reaches a Plasma desktop. Open **Install System** from the
+application menu or the desktop. Ivan's stick reaches Hyprland: open the
+application launcher with Super+P and choose **Install System** or **Start
+personal setup**, or run `family-installer` from Ghostty (Super+Shift+Return).
+The boot menu also offers memtest86+; Ivan's stick additionally offers
+PassMark MemTest86.
 
 ## Connect a remote helper
 
 Someone at the computer must connect Wi-Fi or Ethernet and complete any login
-shown by Tailscale. On the family ISO, open Konsole and run:
+shown by Tailscale. With a bundle that included helper keys and a live
+Tailscale key, this is already done once **Start personal setup** has
+unlocked it. Otherwise, on the generic stick, open Konsole and run:
 
 ```sh
 sudo tailscale up
@@ -374,17 +342,18 @@ tailscale ip -4
 
 Set a temporary password for the live `nixos` account. Share it privately with
 the helper, along with the printed Tailscale address. Do not put passwords or
-authentication links in a public issue, PR, or transcript.
+authentication links in a public issue, PR, or transcript. On the generic
+stick, the password persists until changed. Tailscale enrollment does not
+survive a reboot.
 
-On a combined rescue system, the live user is `imalison`. Use
-`sudo passwd imalison` if password-based SSH support is needed. On an existing
-persistent rescue USB, first inspect `tailscale status`; avoid replacing its
-existing tailnet identity or resetting its account password without Ivan's
-agreement. The rescue system may already authorize Ivan's SSH public keys.
+On Ivan's stick, the live user is `imalison`, Tailscale is normally already
+enrolled, and Ivan's SSH public keys are authorized. Inspect
+`tailscale status` before changing anything; avoid replacing its tailnet
+identity or account password without Ivan's agreement.
 
-Ivan approves the device and limits its access in the tailnet's policy. Merely
-joining a tailnet does not prove that the intended access restrictions exist.
-No reusable Tailscale enrollment key is embedded in the family ISO.
+Ivan approves the device and limits its access in the tailnet's policy.
+Merely joining a tailnet does not prove that the intended access restrictions
+exist. The generic image contains no Tailscale enrollment key.
 
 From an authorized helper machine, connect with the actual live username:
 
@@ -393,17 +362,18 @@ ssh nixos@100.x.y.z
 ```
 
 Check the live host's fingerprint through the person at the computer before
-accepting a new SSH identity. The live host and the installed computer have
+accepting a new SSH identity. The stick and the installed computer have
 separate identities. A changed fingerprint after reboot requires verification.
 
 SSH provides a shell. Graphical screen sharing is not configured. The person
 at the computer clicks through Calamares while the helper explains choices
-and reads relevant diagnostics. An agent on generic media needs its own login.
-Personal media explicitly supplies the accounts selected during preparation.
+and reads relevant diagnostics. An agent on a generic stick needs its own
+login. A personal bundle explicitly supplies the accounts selected during
+preparation.
 
 Keep a way to contact the person outside this SSH session. Installation and
 reboot end the live session. Generic installations do not inherit the live
-Tailscale or agent login. Personal media provisions the target separately;
+Tailscale or agent login. A personal bundle provisions the target separately;
 temporary live passwords and live Tailscale state are still not copied.
 
 ## Install through Calamares
@@ -549,9 +519,10 @@ The initial remote live session ends at reboot. If persistent SSH was not
 configured, ask the person at the machine to assist with the transfer. Do not
 assume that the pre-installation Tailscale address still reaches the computer.
 
-Copy the machine directory into `nixos/family-installer/machines/<hostname>/`
-in the primary dotfiles checkout. Keep it as an independent machine definition;
-do not import the rescue hardware configuration or Ivan's workstation module.
+Copy the machine directory into `machines/<hostname>/` in a checkout of this
+repository (Ivan's is `~/projects/nixos-portable`). Keep it as an independent
+machine definition; do not import the stick's configuration or Ivan's
+workstation modules.
 Inspect every file for accidental private data before committing or opening a
 public PR. Generated filesystem UUIDs and hardware details also become public
 when committed here. The public enrollment request is for review; it is not a
@@ -560,10 +531,9 @@ credential and does not authorize any grant.
 On the workstation, replace `dad-laptop` below with the real hostname:
 
 ```sh
-cd /srv/dotfiles
+cd ~/projects/nixos-portable
 git switch -c register-dad-laptop
-git add nixos/family-installer/machines/dad-laptop
-cd nixos/family-installer
+git add machines/dad-laptop
 nix develop --command just check
 nix build .#nixosConfigurations.dad-laptop.config.system.build.toplevel
 ```
@@ -587,14 +557,14 @@ Review and publish that change through `family-stable` before activating it on
 the family computer. On that computer, use its real hostname in the quoted URL:
 
 ```sh
-sudo nixos-rebuild switch --flake 'git+https://github.com/colonelpanic8/dotfiles?dir=nixos/family-installer&ref=family-stable#dad-laptop'
+sudo nixos-rebuild switch --flake 'github:colonelpanic8/nixos-portable/family-stable#dad-laptop'
 systemctl status nixos-upgrade.timer
 systemctl list-timers nixos-upgrade.timer
 ```
 
-This activation command is for the family computer. Ivan's existing dotfiles
-workstation and writable rescue system have their own rebuild instructions;
-use `just switch` from their primary `/srv/dotfiles/nixos` checkout.
+This activation command is for the family computer. Ivan's workstations and
+his own stick rebuild with `just switch` from their primary
+`/srv/dotfiles/nixos` checkout.
 
 Updates run daily with up to 45 minutes of randomized delay. They use the
 release's lockfile, retain boot entries, and do not reboot automatically. An
@@ -649,9 +619,14 @@ installation or authentication failure. Choosing **Ivan** does not grant them.
 ### The USB does not boot
 
 Check that the writer used raw image mode, selected the intended whole device,
-and finished syncing. Compare the original ISO checksum with the recorded
-build checksum. Inspect the firmware's USB and UEFI choices. If possible, try
-the ISO in a VM before rewriting a stick or changing more firmware settings.
+and finished syncing. Compare the image checksum with the recorded build
+checksum. The stick boots only in UEFI mode; inspect the firmware's USB, UEFI,
+and Secure Boot choices. If possible, try the image with `just vm` before
+rewriting a stick or changing more firmware settings.
+
+If the stick boots once but not after its first boot, the systemd-boot install
+may have failed. Choose the remaining entry, then inspect
+`journalctl -u portable-install-bootloader`.
 
 ### Wi-Fi or remote access fails
 
@@ -666,11 +641,10 @@ resolve a connection failure by granting the machine broad secret access.
 Launch through **Install System** or `family-installer`. The launcher uses the
 privileged wrapper and permits the local root user to display the installer
 on Xwayland. Running the bare `calamares` binary as an ordinary user cannot
-complete privileged disk operations. A `pkexec must be setuid root` error on
-older combined media requires rebuilding with the current installer module.
+complete privileged disk operations.
 
 Keep the live environment running. Use **Toggle log** and inspect the session
-log. In the tested family ISO, the privileged session log was at
+log. In the tested installer, the privileged session log was at
 `/root/.cache/calamares/session.log`; another launch context may place it under
 `~/.cache/calamares/session.log` instead.
 
@@ -680,21 +654,16 @@ lsblk -f
 findmnt
 ```
 
-Record the failed job, exact error, ISO commit, selected disk, firmware mode,
+Record the failed job, exact error, image commit, selected disk, firmware mode,
 and whether partitioning already ran. Review and redact logs before sharing;
 logs can contain usernames, hardware details, and other sensitive information.
-Do not reboot until the needed diagnostics have been saved outside the
-ephemeral live filesystem.
+The stick's filesystem persists, but the setup session's home and
+`/run/family-installer` do not. Save diagnostics before rebooting.
 
 The helper rejects invalid identities before partitioning. If validation fails,
 correct the user or computer name. If preparation says an existing checkout
 cannot be overwritten, inspect it before making any change. Never delete a
 configuration directory just to bypass that protection.
-
-If an old image reports an unsupported `submodules` parameter on a **path**
-URL, rebuild from the current family release. The consolidated installer has
-no submodule dependency or `self.submodules` hint. Old media retain their
-original source and documentation until rebuilt.
 
 ### Installation finished but boot or login fails
 
@@ -704,7 +673,7 @@ helper cannot reach the normal SSH server while the computer waits for disk
 unlock. If an update fails to boot, select a retained earlier NixOS generation
 from the boot menu.
 
-To inspect a damaged installation, boot the USB again, identify its partitions
+To inspect a damaged installation, boot the stick again, identify its partitions
 with `lsblk -f`, and unlock the correct LUKS volume if needed. Mount the target
 root at `/mnt` and its boot partition at `/mnt/boot` before using
 `sudo nixos-enter --root /mnt`. Mount commands depend on the real filesystem,
@@ -726,8 +695,8 @@ readlink /run/current-system
 readlink -f /etc/nixos
 ```
 
-Confirm the exact hostname is registered on dotfiles' `family-stable`. Use the
-quoted Git URL with `dir=nixos/family-installer`. Build a candidate before switching. For a manual
+Confirm the exact hostname is registered on this repository's `family-stable`
+branch. Build a candidate before switching. For a manual
 local configuration build, use `nixos-rebuild build --flake /etc/nixos#dad-laptop`
 with the real hostname. If registration has not happened, continue using the
 local flake and leave managed updates disabled.
@@ -735,14 +704,16 @@ local flake and leave managed updates disabled.
 ## Instructions for an assisting agent
 
 Read [AGENTS.md](AGENTS.md), then locate the current stage in this guide. On
-combined media, these documents are available under `/etc/nixos-family-installer`.
-On an installed family computer, they are in `/srv/nixos-family-installer`.
-An older ISO contains the guide from its own build, which can differ from GitHub.
+a stick, these documents are under `/etc/nixos-family-installer`, and the setup
+session copies them into its `Setup` project. On an installed family computer,
+they are in `/srv/nixos-family-installer`. A stick contains the guide from its
+own build, which can differ from GitHub.
 
 Before choosing commands, establish these facts:
 
-- Are you on Ivan's workstation, an ephemeral family ISO, the persistent rescue
-  USB, or the installed family computer?
+- Are you on Ivan's workstation, a generic stick, Ivan's own stick, or the
+  installed family computer? On a stick, is a personal bundle unlocked
+  (`cat /run/family-installer.ready`)?
 - Who is at the keyboard, and what remote connection survives a reboot?
 - What are the chosen primary username, owner setting, and unique hostname?
 - Which exact disk may be erased, and what data must remain available?
@@ -771,18 +742,26 @@ passwords or private key material.
 
 ## Maintain the installer
 
-Make installer and shared profile changes in `/srv/dotfiles/nixos/family-installer`.
-Follow the dotfiles root `AGENTS.md` and `nixos/AGENTS.md`. Work in the primary
-checkout; do not create a worktree. The safe shared profile is
-`modules/user-profile.nix`. It imports only its local options and aliases.
-The workstation imports the same primary-user option and multiplexer aliases.
+This repository is standalone: Ivan's checkout is `~/projects/nixos-portable`.
+Dotfiles consumes `nixosModules.portable` through its `nixos-portable` flake
+input, so after publishing a change here, update that input in dotfiles
+(`nix flake update nixos-portable` in `/srv/dotfiles/nixos`) and rebuild
+Ivan's stick. Keep credentials and anything specific to Ivan in dotfiles; the
+generic stick must stay credential-free.
 
-The target copies only this installer directory into `/srv/nixos-family-installer`.
-It does not copy the whole dotfiles tree or evaluate the workstation flake,
-fetch its private Railbird input, or require a Taffybar checkout. Nixpkgs and
-Home Manager stay separately locked to 26.05 in this directory.
+The safe shared profile for installed computers is `modules/user-profile.nix`.
+It imports only its local options and aliases. The target copies this whole
+repository into `/srv/nixos-family-installer`, so modules must not import
+anything outside it. It does not evaluate the dotfiles workstation flake,
+fetch its private inputs, or require a Taffybar checkout. Nixpkgs and Home
+Manager stay locked to 26.05 here.
 
-Run the provided checks from `/srv/dotfiles/nixos/family-installer`:
+The modules in `nixosModules.portable` must work with whatever Nixpkgs the
+caller uses: dotfiles evaluates them with its own nixos-unstable. Agent
+packages default to this flake's pins; callers may replace them through
+`familyInstaller.agentTools.packages`.
+
+Run the provided checks:
 
 ```sh
 nix develop --command just fmt-check
@@ -793,35 +772,39 @@ nix build .#calamares-extensions
 ```
 
 `just check` combines formatting, lint, Python tests, and flake evaluation.
-`nix flake check` also builds the checks. An ISO build alone does not prove
-that installation succeeds. For behavior changes, test the graphical choices,
-partitioning and encryption, completion, reboot, login, target configuration,
-and personal-data exclusions in a disposable VM before promoting the release.
-For rescue integration changes, also check its account, desktop, and boot
-configuration; the installer module must not replace those settings.
+`nix flake check` also builds the checks. An image build alone does not prove
+that installation succeeds. For behavior changes, run `just vm` and test the
+first boot, personal setup, the graphical choices, partitioning and
+encryption, completion, reboot, login, target configuration, and personal-data
+exclusions before promoting the release. For changes that touch the shared
+module, also build Ivan's stick from dotfiles (`just rescue-usb-build`).
 
-Promote a reviewed dotfiles commit by fast-forwarding its `family-stable`
-branch and pushing it. Do not force-push the release branch or advance it
-merely to match the latest workstation change. The release URL selects
-`nixos/family-installer` at that commit and uses its own lockfile. A new image build is required
-for USB media to include changed code or documentation. Updating GitHub alone
-does not update an already-written USB.
+Promote a reviewed commit by fast-forwarding `family-stable` and pushing it.
+Do not force-push the release branch. A stick only changes when it is rebuilt
+(`nixos-rebuild switch` on the stick) or rewritten. Updating GitHub alone does
+not update an already-written stick.
 
 ## Implementation reference
 
 | File or output | Responsibility |
 | --- | --- |
-| `modules/iso.nix` | Standalone Plasma media and live Tailscale daemon |
-| `modules/calamares.nix` | Reusable installer packages, customization, and installed guide |
+| `modules/portable.nix` | The stick: live user, desktop, hardware support, rescue kit, Tailscale, SSH |
+| `modules/usb-image.nix` | Partition layout, systemd-boot, the repart image, and first-boot setup |
+| `modules/personal-setup.nix` | **Start personal setup**, bundle unlocking, and the isolated setup home |
+| `modules/agent-tools.nix` | T3 Code, Codex, and Claude Code |
+| `modules/calamares.nix` | Installer packages, customization, and installed guide |
 | `calamares/owner.conf` | Ivan or Another person selection |
 | `calamares/family-validate/` | Identity validation before disk operations |
 | `scripts/patch_calamares.py` | Checked integration points in the pinned upstream installer |
+| `scripts/prepare_media.py` | Writing sticks and adding personal bundles from a trusted computer |
+| `scripts/provisioning.py` | Bundle unlocking, credential handoff, and target first boot |
 | `scripts/prepare_target.py` | Target source, machine definition, host identity, and final configuration link |
 | `modules/managed-system.nix` | Registered-machine update options and retention defaults |
 | `machines/<hostname>/` | Reviewed machine registrations |
 | `modules/user-profile.nix` | Safe shared primary-user profile |
-| `packages.x86_64-linux.iso` | Standalone bootable family ISO |
-| `nixosModules.installer` | Installer module for another NixOS rescue environment |
+| `nixosModules.portable` | The stick module, carrying this flake's agent pins |
+| `nixosConfigurations.portable` | The generic stick |
+| `packages.x86_64-linux.usb-image` | Raw image of the generic stick |
 
 The installed filesystem contains:
 
@@ -836,29 +819,16 @@ The installed filesystem contains:
 
 The copied source is editable by root, not a Git checkout. It is a
 self-contained flake with no parent-directory imports or submodule dependency.
-The managed update URL uses `dir=nixos/family-installer` to select the same
-flake within the published dotfiles repository.
 
 The installer sets the target's initial `system.stateVersion` from its own
-pinned NixOS release, even when the rescue environment runs a newer release.
-The installer preserves Calamares' generated disks, bootloader, desktop,
-locale, and account settings. Calamares sets the chosen passwords separately.
-Preparing the flake preserves an existing generated host key when retried.
-Finishing moves the original configuration aside and links `/etc/nixos` to the
-local flake. Unrelated existing checkouts and backups cause an error rather
-than being overwritten.
-
-The standalone installer passed formatting, lint, behavior tests, and Nix
-checks. An x86_64 VM completed the Plasma flow with a non-Ivan account, UEFI,
-and LUKS2 encryption. It rebooted from the installed disk and accepted the
-chosen disk and account passwords. Checks in that system verified the local
-flake, shared tools, host identity, empty secret request, disabled initial
-updates, and personal-data exclusions. The combined rescue image also completed an
-encrypted UEFI installation and target login in a VM; a fresh image boot
-verified Hyprland and the custom installer launcher. Physical hardware, other
-desktops, and remote support access require their own verification. After this
-source relocation, repeat the preparation and configuration checks before
-building new media; prior VM results describe the installer before the move.
+pinned NixOS release, even when the stick runs a newer release. The installer
+preserves Calamares' generated disks, bootloader, desktop, locale, and account
+settings. Calamares sets the chosen passwords separately. Preparing the flake
+preserves an existing generated host key when retried. Finishing moves the
+original configuration aside and links `/etc/nixos` to the local flake.
+Unrelated existing checkouts and backups cause an error rather than being
+overwritten. Calamares itself leaves out the disk holding the running `/`, so
+it does not offer the stick as an installation target.
 
 The installer's original code is MIT licensed. Bundled NixOS, Calamares, and
 other dependencies retain their upstream licenses.

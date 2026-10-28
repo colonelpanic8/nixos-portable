@@ -19,21 +19,31 @@ check: fmt-check lint test
     nix flake check --no-build
 
 build:
-    nix build .#iso
+    nix build .#usb-image
 
 prepare *args:
-    python scripts/prepare_media.py --source . {{args}}
+    python scripts/prepare_media.py {{args}}
 
+# Boot a disposable copy of the built image under UEFI, with a blank disk to install onto.
 vm:
     #!/usr/bin/env bash
     set -euo pipefail
-    iso=$(find -L result/iso -maxdepth 1 -name '*.iso' -print -quit)
-    test -n "$iso"
-    disk=$(mktemp --suffix=.qcow2)
-    qemu-img create -f qcow2 "$disk" 40G
+    image=$(find -L result -maxdepth 1 -name '*.raw.xz' -print -quit)
+    test -n "$image"
+    work=$(mktemp -d)
+    xz -dc "$image" | cp --sparse=always /dev/stdin "$work/stick.raw"
+    truncate -s 32G "$work/stick.raw"
+    qemu-img create -f qcow2 "$work/target.qcow2" 40G
+    cp "${OVMF:?run inside nix develop}/FV/OVMF_VARS.fd" "$work/vars.fd"
+    chmod u+w "$work/vars.fd"
+    code=$OVMF/FV/OVMF_CODE.fd
     acceleration=tcg
     if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then acceleration=kvm; fi
-    echo "VM disk: $disk"
-    qemu-system-x86_64 -accel "$acceleration" -m 4096 -smp 4 \
-      -drive "file=$disk,format=qcow2,if=virtio" -cdrom "$iso" -boot d \
+    echo "VM files: $work"
+    qemu-system-x86_64 -accel "$acceleration" -m 6144 -smp 4 -vga virtio \
+      -drive "if=pflash,format=raw,readonly=on,file=$code" \
+      -drive "if=pflash,format=raw,file=$work/vars.fd" \
+      -drive "file=$work/stick.raw,format=raw,if=none,id=stick" \
+      -device qemu-xhci -device usb-storage,drive=stick,bootindex=0 \
+      -drive "file=$work/target.qcow2,format=qcow2,if=virtio" \
       -nic user,model=virtio-net-pci

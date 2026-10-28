@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from prepare_media import codex_credentials, inspect_usb, write_usb
+from prepare_media import build_image, codex_credentials, inspect_usb, unmount, write_usb
 from prepare_target import prepare_target
 from provisioning import (
     boot_target,
@@ -16,6 +16,7 @@ from provisioning import (
     encrypt_for_host,
     install_accounts,
     install_identity,
+    live_codex_pids,
     load_live_seed,
     public_key,
     provision_target,
@@ -81,8 +82,10 @@ class ProvisioningTests(unittest.TestCase):
         prepare_target(source, root, "alex", "alex-nixos", "other", self.seed)
         return root
 
-    def unlock(self, home, state, tailscale=None):
-        bundle = self.base / "family-seed.age"
+    def unlock(self, home, state, tailscale=None, backend="NeedsLogin"):
+        bundles = self.base / "setup"
+        bundles.mkdir(exist_ok=True)
+        bundle = bundles / "alex-nixos.age"
         bundle.write_text("passphrase-encrypted")
         ready = self.base / "family-installer.ready"
 
@@ -93,11 +96,14 @@ class ProvisioningTests(unittest.TestCase):
 
         def run(args, **kwargs):
             self.assertEqual(args[0], "tailscale")
+            if args[1] == "status":
+                status = json.dumps({"BackendState": backend})
+                return subprocess.CompletedProcess(args, 0, stdout=status)
             return tailscale(args)
 
         fake = SimpleNamespace(check_output=check_output, run=run)
         with self.user(home), patch("provisioning.subprocess", fake):
-            unlock_live(bundle, "nixos", state=state, ready=ready)
+            unlock_live(bundle, "nixos", state=state, ready=ready, home=state.parent / "setup-home")
         return bundle, ready
 
     def test_accounts_require_prepared_host_identity(self):
@@ -157,45 +163,69 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(json.loads(auth.read_text()), {"refreshed": True})
 
     def test_locked_personal_bundle_blocks_installation(self):
-        bundle = self.base / "family-seed.age"
+        bundles = self.base / "setup"
+        bundles.mkdir()
         state = self.base / "state"
-        self.assertIsNone(load_live_seed(bundle, state))
-        bundle.write_text("passphrase-encrypted")
+        self.assertIsNone(load_live_seed(bundles, state))
+        (bundles / "alex-nixos.age").write_text("passphrase-encrypted")
         with self.assertRaisesRegex(ValueError, "Unlock"):
-            load_live_seed(bundle, state)
+            load_live_seed(bundles, state)
         state.mkdir()
         (state / "seed.json").write_text(json.dumps(self.seed))
         with self.assertRaisesRegex(ValueError, "Unlock"):
-            load_live_seed(bundle, state)
+            load_live_seed(bundles, state)
 
     def test_unlock_is_idempotent_and_private(self):
         home = self.base / "nixos"
         state = self.base / "state"
-        (home / ".ssh").mkdir(parents=True, mode=0o700)
-        (home / ".ssh/authorized_keys").write_text("ssh-ed25519 existing\n")
         for _ in range(2):
             _, ready = self.unlock(home, state)
-        self.assertEqual(load_live_seed(self.base / "family-seed.age", state), self.seed)
+        self.assertEqual(load_live_seed(self.base / "setup", state), self.seed)
         self.assertEqual(ready.read_text(), "alex-nixos\n")
-        authorized = (home / ".ssh/authorized_keys").read_text().split()
-        self.assertEqual(authorized.count("existing"), 1)
-        self.assertEqual(authorized.count(self.seed["authorizedKeys"][0].split()[1]), 1)
-        auth = home / ".codex/auth.json"
+        authorized = state / "authorized_keys/nixos"
+        self.assertEqual(authorized.read_text().splitlines(), self.seed["authorizedKeys"])
+        auth = self.base / "setup-home/.codex/auth.json"
         self.assertEqual(json.loads(auth.read_text()), self.accounts["codex"])
         self.assertEqual(public_key(state / "target-host-key"), self.seed["hostPublicKey"])
-        for path in (
-            state,
-            auth.parent,
-            home / ".ssh",
-        ):
+        for path in (state, auth.parent.parent, auth.parent):
             self.assertEqual(mode(path), 0o700, path)
-        for path in (
-            state / "target-host-key",
-            state / "seed.json",
-            auth,
-            home / ".ssh/authorized_keys",
-        ):
+        for path in (state / "target-host-key", state / "seed.json", auth):
             self.assertEqual(mode(path), 0o600, path)
+        self.assertEqual(mode(authorized), 0o644)
+
+    def test_stick_user_logins_stay_out_of_the_setup_session(self):
+        home = self.base / "imalison"
+        own = codex_auth("ivan@example.com")
+        install_accounts({"codex": own}, home, os.getuid(), os.getgid())
+        state = self.base / "state"
+        self.unlock(home, state)
+        self.assertEqual(json.loads((home / ".codex/auth.json").read_text()), own)
+        self.assertEqual(
+            json.loads((self.base / "setup-home/.codex/auth.json").read_text()),
+            self.accounts["codex"],
+        )
+
+    def test_unlocking_a_second_computer_requires_a_reboot(self):
+        state = self.base / "state"
+        self.unlock(self.base / "nixos", state)
+        self.seed["hostname"] = "dad-laptop"
+        with self.assertRaisesRegex(ValueError, "reboot"):
+            self.unlock(self.base / "nixos", state)
+
+    def test_only_the_setup_sessions_codex_is_stopped(self):
+        proc = self.base / "proc"
+        setup = Path("/run/family-setup")
+        for pid, name, home in (
+            ("10", "codex", setup),
+            ("11", ".codex-wrapped", setup),
+            ("12", "codex", Path("/home/imalison")),
+            ("13", "bash", setup),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "comm").write_text(name + "\n")
+            (proc / pid / "environ").write_bytes(b"PATH=/bin\0HOME=" + bytes(home) + b"\0")
+        (proc / "self").mkdir()
+        self.assertEqual(sorted(live_codex_pids(setup, proc)), [10, 11])
 
     def test_live_tailscale_key_is_removed_after_enrollment(self):
         self.seed["tailscaleLive"] = self.encrypt("tskey-live-fixture")
@@ -215,6 +245,14 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(key_mode, 0o600)
         self.assertFalse((state / "tailscale-live-authkey").exists())
 
+    def test_connected_stick_keeps_its_tailscale_login(self):
+        self.seed["tailscaleLive"] = self.encrypt("tskey-live-fixture")
+
+        def tailscale(args):
+            self.fail("an already connected stick must not re-enroll")
+
+        self.unlock(self.base / "nixos", self.base / "state", tailscale, backend="Running")
+
     def test_failed_live_enrollment_stays_locked_and_removes_key(self):
         self.seed["tailscaleLive"] = self.encrypt("tskey-live-fixture")
         state = self.base / "state"
@@ -226,7 +264,7 @@ class ProvisioningTests(unittest.TestCase):
             self.unlock(self.base / "nixos", state, tailscale=tailscale)
         self.assertFalse((state / "tailscale-live-authkey").exists())
         with self.assertRaisesRegex(ValueError, "Unlock"):
-            load_live_seed(self.base / "family-seed.age", state)
+            load_live_seed(self.base / "setup", state)
 
     def test_finish_hands_off_current_live_credentials_once(self):
         self.seed["tailscaleTarget"] = self.encrypt("tskey-target-fixture")
@@ -293,12 +331,13 @@ class ProvisioningTests(unittest.TestCase):
             "BusProtocol": "USB",
             "Writable": True,
             "TotalSize": 100,
+            "DeviceIdentifier": "disk2",
         }
         with (
             patch("prepare_media.platform.system", return_value="Darwin"),
             patch("prepare_media.subprocess.check_output", return_value=plistlib.dumps(valid)),
         ):
-            self.assertEqual(inspect_usb("/dev/disk2", 50), valid)
+            self.assertEqual(inspect_usb("/dev/disk2", 50)["raw"], "/dev/rdisk2")
         for change in (
             {"Internal": True},
             {"WholeDisk": False},
@@ -315,40 +354,118 @@ class ProvisioningTests(unittest.TestCase):
             ):
                 inspect_usb("/dev/disk2", 50)
 
+    def test_linux_writer_accepts_only_whole_writable_usb_disks(self):
+        valid = {
+            "path": "/dev/sdb",
+            "type": "disk",
+            "tran": "usb",
+            "ro": False,
+            "size": 100,
+            "model": "Stick",
+            "serial": "1",
+        }
+
+        def listing(info):
+            return json.dumps({"blockdevices": [info]}).encode()
+
+        with (
+            patch("prepare_media.platform.system", return_value="Linux"),
+            patch("prepare_media.subprocess.check_output", return_value=listing(valid)),
+        ):
+            self.assertEqual(inspect_usb("/dev/disk/by-id/usb-stick", 50)["raw"], "/dev/sdb")
+        for change in ({"type": "part"}, {"tran": "nvme"}, {"ro": True}, {"size": 1}):
+            with (
+                patch("prepare_media.platform.system", return_value="Linux"),
+                patch(
+                    "prepare_media.subprocess.check_output", return_value=listing(valid | change)
+                ),
+                self.assertRaises(ValueError),
+            ):
+                inspect_usb("/dev/sdb", 50)
+
+    def test_stick_parameters_reach_mk_stick(self):
+        calls = []
+
+        def run(*command, env):
+            calls.append((command, env))
+            link = Path(command[command.index("--out-link") + 1])
+            link.mkdir()
+            (link / "nixos-portable.raw.xz").touch()
+
+        stick = {"user": "dad", "hostname": "dad-stick"}
+        with patch("prepare_media.run", side_effect=run):
+            image = build_image(Path("/src"), self.base, stick)
+        [(command, env)] = calls
+        expression = command[command.index("--expr") + 1]
+        self.assertTrue(expression.startswith('((builtins.getFlake "git+file:///src").lib.mkStick'))
+        self.assertTrue(expression.endswith(").config.system.build.usbImage"))
+        self.assertEqual(json.loads(env["PORTABLE_STICK"]), stick)
+        self.assertEqual(image.name, "nixos-portable.raw.xz")
+
+    def test_linux_writer_unmounts_only_mounted_partitions(self):
+        tree = {
+            "blockdevices": [
+                {
+                    "path": "/dev/sdb",
+                    "mountpoints": [None],
+                    "children": [
+                        {"path": "/dev/sdb1", "mountpoints": ["/run/media/x/SETUP"]},
+                        {"path": "/dev/sdb2", "mountpoints": [None]},
+                    ],
+                }
+            ]
+        }
+        with (
+            patch("prepare_media.platform.system", return_value="Linux"),
+            patch("prepare_media.subprocess.check_output", return_value=json.dumps(tree).encode()),
+            patch("prepare_media.run") as run,
+        ):
+            unmount({"raw": "/dev/sdb"})
+        self.assertEqual(
+            [call.args for call in run.call_args_list], [("sudo", "umount", "/dev/sdb1")]
+        )
+
     def test_usb_copy_and_verification_commands_with_regular_files(self):
-        image = self.base / "installer.iso"
-        image.write_bytes(b"installer fixture\n" * 1000)
+        raw = self.base / "nixos-portable.raw"
+        raw.write_bytes(b"installer fixture\n" * 1000)
+        subprocess.run(["xz", "--keep", "-1", str(raw)], check=True)
+        for image in (raw, raw.with_suffix(".raw.xz")):
+            with self.subTest(image=image.name):
+                self.assert_usb_write(image, raw.read_bytes())
+
+    def assert_usb_write(self, image, expected):
         target = self.base / "usb.img"
-        target.write_bytes(b"x" * (image.stat().st_size + 37))
+        target.write_bytes(b"x" * (len(expected) + 37))
         raw_device = "/dev/rdisk-test"
-        info = {"DeviceIdentifier": "disk-test", "TotalSize": target.stat().st_size}
+        info = {
+            "id": "disk-test",
+            "name": "Stick",
+            "size": target.stat().st_size,
+            "raw": raw_device,
+            "identity": ["disk-test"],
+        }
         disk_actions = []
 
         def run(*command):
-            if command[0] == "sudo":
-                args = list(command[1:])
-                if args[0] == "dd":
-                    destination = f"of={raw_device}"
-                    self.assertIn(destination, args)
-                    args[args.index(destination)] = f"of={target}"
-                    args.append("conv=notrunc")
-                else:
-                    self.assertEqual(args[0], "cmp")
-                    self.assertEqual(args[-1], raw_device)
-                    args[-1] = target
-                subprocess.run(args, check=True, capture_output=True)
+            if command[:2] == ("sh", "-c"):
+                pipeline = command[2].replace("sudo ", "").replace(raw_device, str(target))
+                if " dd " in pipeline:
+                    pipeline += " conv=notrunc"
+                subprocess.run(["sh", "-c", pipeline], check=True, capture_output=True)
             elif command[0] == "diskutil":
                 disk_actions.append(command[1])
             else:
                 self.assertEqual(command, ("sync",))
 
         with (
-            patch("prepare_media.inspect_usb", return_value=info),
+            patch("prepare_media.platform.system", return_value="Darwin"),
+            patch("prepare_media.inspect_usb", return_value=info) as inspect,
             patch("builtins.input", return_value="ERASE disk-test"),
             patch("prepare_media.run", side_effect=run),
         ):
             write_usb(image, "/dev/disk-test")
-        self.assertEqual(target.read_bytes(), image.read_bytes() + b"x" * 37)
+        self.assertEqual(inspect.call_args.args[1], len(expected))
+        self.assertEqual(target.read_bytes(), expected + b"x" * 37)
         self.assertEqual(disk_actions, ["unmountDisk", "eject"])
 
     def test_dedicated_codex_profile_is_exported(self):

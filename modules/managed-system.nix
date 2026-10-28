@@ -10,7 +10,7 @@ in {
     enable = lib.mkEnableOption "updates after this machine is registered in the family release";
     source = lib.mkOption {
       type = lib.types.str;
-      default = "git+https://github.com/colonelpanic8/dotfiles?dir=nixos/family-installer&ref=family-stable";
+      default = "git+https://github.com/colonelpanic8/nixos-portable?ref=family-stable";
       description = "Published installer repository and tested release ref.";
     };
   };

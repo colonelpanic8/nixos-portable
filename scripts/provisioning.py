@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import time
 
@@ -67,10 +68,18 @@ def read_seed(path):
     return seed
 
 
-def load_live_seed(bundle=Path("/iso/family-seed.age"), state=Path("/run/family-installer")):
+LIVE_STATE = Path("/run/family-installer")
+# Owned by the live user, outside the root-only state directory.
+SETUP_HOME = Path("/run/family-setup")
+
+
+def load_live_seed(bundles=Path("/setup"), state=LIVE_STATE):
     seed = read_seed(state / "seed.json")
-    if bundle.exists() and (seed is None or not (state / "unlocked").exists()):
-        raise ValueError("Unlock this personal USB with Start personal setup before installing")
+    if any(bundles.glob("*.age")) and (seed is None or not (state / "unlocked").exists()):
+        raise ValueError(
+            "Unlock a personal bundle with Start personal setup before installing, "
+            "or move the bundles off the SETUP volume for a generic installation"
+        )
     return seed
 
 
@@ -132,7 +141,7 @@ def provision_target(seed, root, machine):
     )
 
 
-def refresh_target_accounts(root, seed, home=Path("/home/nixos")):
+def refresh_target_accounts(root, seed, home=SETUP_HOME):
     root = root.resolve()
     if root == Path("/") or not (root / "srv/nixos-family-installer/.installer-source").is_file():
         raise ValueError("The target has not been prepared by this installer")
@@ -163,18 +172,44 @@ def refresh_target_accounts(root, seed, home=Path("/home/nixos")):
         path.unlink(missing_ok=True)
 
 
-def stop_live_codex():
-    command = ["--uid", "nixos", "--exact", "codex|.codex-wrapped"]
-    result = subprocess.run(["pkill", "--signal", "TERM", *command], check=False)
-    if result.returncode not in (0, 1):
-        result.check_returncode()
+def live_codex_pids(home, proc=Path("/proc")):
+    marker = b"HOME=" + str(home).encode()
+    pids = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            name = (entry / "comm").read_text().strip()
+            environment = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if name in {"codex", ".codex-wrapped"} and marker in environment:
+            pids.append(int(entry.name))
+    return pids
+
+
+def stop_live_codex(home=SETUP_HOME):
+    """Stop only the setup session's agents, not other Codex sessions on the stick."""
+    for pid in live_codex_pids(home):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     for _ in range(50):
-        result = subprocess.run(["pgrep", *command], capture_output=True, check=False)
-        if result.returncode == 1:
+        if not live_codex_pids(home):
             return
-        result.check_returncode()
         time.sleep(0.1)
     raise ValueError("Close the live Codex sessions before finishing account transfer")
+
+
+def tailscale_running():
+    result = subprocess.run(
+        ["tailscale", "status", "--json"], capture_output=True, text=True, check=False
+    )
+    try:
+        return json.loads(result.stdout).get("BackendState") == "Running"
+    except ValueError:
+        return False
 
 
 def boot_target(
@@ -199,27 +234,39 @@ def boot_target(
 
 
 def unlock_live(
-    bundle, username, state=Path("/run/family-installer"), ready=Path("/run/family-installer.ready")
+    bundle,
+    username,
+    state=LIVE_STATE,
+    ready=Path("/run/family-installer.ready"),
+    home=SETUP_HOME,
 ):
     import pwd
 
     result = subprocess.check_output(["age", "--decrypt", str(bundle)])
     seed = json.loads(result)
     validate_seed(seed)
+    previous = read_seed(state / "seed.json")
+    if previous and previous["hostname"] != seed["hostname"]:
+        raise ValueError(f"This session is already set up for {previous['hostname']}; reboot first")
     key = state / "target-host-key"
     install_identity(seed, key)
     accounts = json.loads(decrypt_for_host(seed["accounts"], key))
     user = pwd.getpwnam(username)
-    install_accounts(accounts, Path(user.pw_dir), user.pw_uid, user.pw_gid)
+    # The setup session gets its own home, so the stick user's logins are never
+    # handed to the installed computer.
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(home, user.pw_uid, user.pw_gid)
+    install_accounts(accounts, home, user.pw_uid, user.pw_gid)
     private_write(state / "seed.json", result)
-    authorized = Path(user.pw_dir) / ".ssh/authorized_keys"
     if seed["authorizedKeys"]:
-        existing = authorized.read_text() if authorized.exists() else ""
-        missing = [key for key in seed["authorizedKeys"] if key not in existing.splitlines()]
-        private_write(authorized, existing.rstrip() + "\n" + "\n".join(missing) + "\n")
-        os.chown(authorized.parent, user.pw_uid, user.pw_gid)
-        os.chown(authorized, user.pw_uid, user.pw_gid)
-    if seed.get("tailscaleLive"):
+        authorized = state / "authorized_keys" / username
+        authorized.parent.mkdir(parents=True, exist_ok=True)
+        authorized.parent.chmod(0o755)
+        private_write(authorized, "\n".join(seed["authorizedKeys"]) + "\n")
+        authorized.chmod(0o644)
+    if seed.get("tailscaleLive") and tailscale_running():
+        print("Tailscale is already connected on this stick; keeping its existing login.")
+    elif seed.get("tailscaleLive"):
         auth = state / "tailscale-live-authkey"
         private_write(auth, decrypt_for_host(seed["tailscaleLive"], key))
         try:
